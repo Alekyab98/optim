@@ -1,0 +1,207 @@
+MERGE INTO `${aether_5g_core_module_tgt_project_id}.${aether_5g_core_module_tgt_dataset_name}.${aether_5g_core_module_tgt_smf_tblname}` tgt
+USING (
+  SELECT
+    event_time AS event_time,
+    "ericsson" AS vendor,
+    fqdn,
+    labels,
+    KEY AS metric_name,
+    SAFE_CAST(increase_value AS BIGNUMERIC) AS metric_increase_value,
+    SAFE_CAST(sum_value AS BIGNUMERIC) AS metric_sum_value,
+    SAFE_CAST(sum_by_value AS BIGNUMERIC) AS metric_sum_by_value,
+    trans_dt,
+    DATETIME(process_ts) AS schedule_time,
+    CURRENT_TIMESTAMP AS updated_timestamp
+  FROM (
+    WITH event_timestamps AS (
+      SELECT DISTINCT DATETIME_TRUNC(TIMESTAMP(`timestamp`), HOUR) AS trans_hr
+      FROM `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+      WHERE DATETIME_TRUNC(TIMESTAMP(insert_date_utc), HOUR) IN UNNEST(
+        GENERATE_TIMESTAMP_ARRAY(
+          TIMESTAMP_SUB(DATETIME_TRUNC(TIMESTAMP(trans_ts), HOUR), INTERVAL window_interval - 1 HOUR),
+          DATETIME_TRUNC(TIMESTAMP(trans_ts), HOUR),
+          INTERVAL window_hour HOUR
+        )
+      )
+      AND trans_dt IS NOT NULL
+    ),
+    
+    base_data AS (
+      SELECT *,
+        MD5(labels) AS checksum
+      FROM (
+        SELECT DISTINCT
+          TIMESTAMP_SECONDS(CAST(FLOOR(UNIX_SECONDS(`timestamp`) / (window_hour * 3600)) * (window_hour * 3600) AS INT64)) AS event_time,
+          fqdn,
+          TO_JSON_STRING(
+            JSON_REMOVE(
+              SAFE.PARSE_JSON(labels),
+              '$.__name__',
+              '$.jobid',
+              '$.job',
+              '$.localdn',
+              '$.instance',
+              '$.write_relabel_group',
+              '$.kubernetes_namespace',
+              '$.kubernetes_pod_name',
+              '$.applicationId'
+            )
+          ) AS labels,
+          JSON_VALUE(labels, '$.instance') AS instance,
+          LOWER(name) AS KEY,
+          SAFE_CAST(NULLIF(value, 'NaN') AS FLOAT64) AS value,
+          DATE(`timestamp`) AS trans_dt,
+          `timestamp`
+        FROM `${aether_5g_core_module_src_project_id}.${aether_5g_core_module_src_dataset_name}.${aether_5g_core_module_src_smf_tblname}`
+        WHERE
+          DATETIME_TRUNC(TIMESTAMP(`timestamp`), HOUR) IN (SELECT trans_hr FROM event_timestamps)
+          AND insert_date_utc > (SELECT MIN(trans_hr) FROM event_timestamps)
+          AND trans_dt IN (SELECT DATE(trans_hr) FROM event_timestamps)
+          AND trans_dt IS NOT NULL
+      )
+    ),
+
+    -- 🆕 New CTE to get the value at max timestamp per group (per hour)
+    latest_value_per_hour AS (
+      SELECT
+        trans_dt,
+        event_time,
+        fqdn,
+        instance,
+        checksum,
+        KEY,
+        value AS sum_by_value
+      FROM (
+        SELECT *,
+          ROW_NUMBER() OVER (
+            PARTITION BY trans_dt, event_time, fqdn, instance, checksum, KEY
+            ORDER BY `timestamp` DESC
+          ) AS rn
+        FROM base_data
+      )
+      WHERE rn = 1
+    ),
+
+    window_data AS (
+      SELECT *,
+        IF(value < prev_value, 1, 0) AS has_reset
+      FROM (
+        SELECT
+          trans_dt,
+          event_time,
+          fqdn,
+          labels,
+          checksum,
+          instance,
+          KEY,
+          value,
+          `timestamp`,
+          SAFE_CAST(LAG(value) OVER (
+            PARTITION BY fqdn, instance, checksum, KEY, DATETIME_TRUNC(`timestamp`, HOUR)
+            ORDER BY `timestamp`
+          ) AS FLOAT64) AS prev_value
+        FROM base_data
+      )
+    ),
+
+    reset_adjusted AS (
+      SELECT
+        wd.event_time,
+        wd.fqdn,
+        wd.instance,
+        wd.trans_dt,
+        MAX(wd.labels) AS labels,
+        wd.checksum,
+        wd.KEY,
+        SUM(wd.value) AS sum_value,
+        SUM(
+          CASE
+            WHEN wd.prev_value IS NULL THEN 0
+            WHEN wd.has_reset = 1 THEN wd.value
+            ELSE wd.value - IFNULL(wd.prev_value, 0)
+          END
+        ) AS increase_value,
+        MAX(lvph.sum_by_value) AS sum_by_value
+      FROM window_data wd
+      LEFT JOIN latest_value_per_hour lvph
+        ON wd.trans_dt = lvph.trans_dt
+        AND wd.event_time = lvph.event_time
+        AND wd.fqdn = lvph.fqdn
+        AND wd.instance = lvph.instance
+        AND wd.checksum = lvph.checksum
+        AND wd.KEY = lvph.KEY
+      GROUP BY
+        wd.trans_dt,
+        wd.event_time,
+        wd.fqdn,
+        wd.instance,
+        wd.checksum,
+        wd.KEY
+    )
+
+    SELECT
+      event_time,
+      fqdn,
+      trans_dt,
+      SAFE.PARSE_JSON(labels) AS labels,
+      checksum,
+      KEY,
+      SUM(increase_value) AS increase_value,
+      SUM(sum_value) AS sum_value,
+      MAX(sum_by_value) AS sum_by_value
+    FROM reset_adjusted
+    GROUP BY
+      event_time,
+      fqdn,
+      trans_dt,
+      labels,
+      checksum,
+      KEY
+    ORDER BY
+      trans_dt,
+      event_time,
+      fqdn,
+      checksum,
+      KEY
+  )
+) src
+ON (
+  tgt.trans_dt = src.trans_dt
+  AND tgt.event_time = src.event_time
+  AND tgt.fqdn = src.fqdn
+  AND tgt.metric_name = src.metric_name
+  AND TO_JSON_STRING(tgt.labels) = TO_JSON_STRING(src.labels)
+)
+WHEN MATCHED THEN UPDATE SET
+  tgt.metric_increase_value = src.metric_increase_value,
+  tgt.metric_sum_value = src.metric_sum_value,
+  tgt.metric_sum_by_value = src.metric_sum_by_value,
+  tgt.updated_timestamp = src.updated_timestamp,
+  tgt.schedule_time = src.schedule_time
+WHEN NOT MATCHED THEN
+INSERT (
+  event_time,
+  vendor,
+  fqdn,
+  labels,
+  metric_name,
+  metric_increase_value,
+  metric_sum_value,
+  metric_sum_by_value,
+  trans_dt,
+  schedule_time,
+  updated_timestamp
+)
+VALUES (
+  src.event_time,
+  src.vendor,
+  src.fqdn,
+  src.labels,
+  src.metric_name,
+  src.metric_increase_value,
+  src.metric_sum_value,
+  src.metric_sum_by_value,
+  src.trans_dt,
+  src.schedule_time,
+  src.updated_timestamp
+);
